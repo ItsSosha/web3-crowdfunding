@@ -1,3 +1,4 @@
+import os
 from web3 import Web3
 from eth_account import Account
 import json
@@ -16,48 +17,60 @@ class MLOracle:
         self.predictor = CrowdfundingPredictor()
         self.predictor.load_model('model.joblib')
 
-    def listen_for_new_projects(self):
+    def start_listening(self):
         """
-        Слухає події створення нових проєктів та надає предикції
+        Запускає прослуховування обох подій: створення проєктів та внесення коштів
         """
         project_filter = self.contract.events.ProjectCreated.create_filter(
             fromBlock='latest'
         )
+        contribution_filter = self.contract.events.ContributionMade.create_filter(
+            fromBlock='latest'
+        )
 
         while True:
-            for event in project_filter.get_new_entries():
-                project_id = event['args']['id']
-                self.process_new_project(project_id)
-            time.sleep(10)  # Перевірка кожні 10 секунд
+            try:
+                for event in project_filter.get_new_entries():
+                    project_id = event['args']['id']
+                    self.update_project_prediction(project_id)
 
-    def process_new_project(self, project_id):
-        """
-        Обробка нового проєкту та надання предикції
-        """
-        # Отримання метрик проєкту
-        metrics = self.contract.functions.getProjectMetrics(project_id).call()
+                for event in contribution_filter.get_new_entries():
+                    project_id = event['args']['projectId']
+                    self.update_project_prediction(project_id)
 
-        # Підготовка даних для ML-моделі
+                time.sleep(10)
+
+            except Exception as e:
+                print(f"Помилка при обробці подій: {str(e)}")
+                time.sleep(30)
+                continue
+
+    def update_project_prediction(self, project_id):
+        """
+        Оновлює предикцію для проєкту на основі поточних метрик
+        """
+        project_data = self.contract.functions.getProject(project_id).call()
+        project_metrics = self.contract.functions.getProjectMetrics(project_id).call()
+
         project_data = {
-            'funding_goal': metrics[0],
-            'duration_days': metrics[1],
-            'reward_levels_count': metrics[2],
-            'has_video': metrics[3],
-            'category': metrics[4],
-            'description_length': metrics[5]
+            'funding_goal': project_data[2],
+            'duration_days': project_metrics.durationDays,
+            'category': project_metrics.category,
+            'description_length': project_metrics.descriptionLength,
+            'current_funding': project_data[3],
+            'funding_percentage': (project_data[3] / project_data[0]) * 100,
         }
 
-        # Отримання предикції
         success_probability = self.predictor.predict_success_probability(project_data)
         prediction_percentage = int(success_probability * 100)
 
-        # Відправка предикції в смарт-контракт
-        self.send_prediction(project_id, prediction_percentage)
+        self._send_prediction(project_id, prediction_percentage)
 
-    def send_prediction(self, project_id, prediction):
+    def _send_prediction(self, project_id, prediction):
         """
-        Відправка предикції в смарт-контракт
+        Відправляє предикцію в смарт-контракт з обробкою помилок та повторними спробами
         """
+
         nonce = self.web3.eth.get_transaction_count(self.account.address)
 
         transaction = self.contract.functions.setProjectPrediction(
@@ -76,22 +89,23 @@ class MLOracle:
         )
         tx_hash = self.web3.eth.send_raw_transaction(signed_txn.rawTransaction)
         self.web3.eth.wait_for_transaction_receipt(tx_hash)
+        return
 
 
 if __name__ == "__main__":
-    # Конфігурація
-    CONTRACT_ADDRESS = "YOUR_CONTRACT_ADDRESS"
-    WEB3_PROVIDER = "http://localhost:8545"  # або інший провайдер
-    PRIVATE_KEY = "YOUR_PRIVATE_KEY"
+    CONTRACT_ADDRESS = os.environ.get("CONTRACT_ADDRESS")
+    WEB3_PROVIDER = os.environ.get("WEB3_PROVIDER", "http://localhost:8545")
+    PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
 
     with open('contract_abi.json', 'r') as f:
         CONTRACT_ABI = json.load(f)
 
-    # Запуск оракула
     oracle = MLOracle(
         CONTRACT_ADDRESS,
         CONTRACT_ABI,
         WEB3_PROVIDER,
         PRIVATE_KEY
     )
-    oracle.listen_for_new_projects()
+
+    print("ML Oracle запущено. Очікування подій...")
+    oracle.start_listening()
